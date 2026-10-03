@@ -1,0 +1,103 @@
+# UNCLASSIFIED // DEMO ONLY
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  AUDIT_GATE: "false"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate sample package
+        run: npm run sample
+
+      - name: Smoke test (start + ingest sample)
+        run: npm run smoke
+
+      - name: npm audit
+        id: audit
+        run: |
+          set +e
+          npm audit --json > audit.json
+          AUDIT_EXIT=$?
+          set -e
+
+          {
+            echo "## npm audit summary"
+            echo ""
+            echo "AUDIT_GATE=${AUDIT_GATE}"
+            echo ""
+            if command -v jq >/dev/null 2>&1 && [[ -s audit.json ]]; then
+              echo '```'
+              jq -r '
+                "vulnerabilities: " + (.metadata.vulnerabilities | to_entries | map("\(.key)=\(.value)") | join(", ")),
+                "total=" + ((.metadata.vulnerabilities.info // 0)
+                  + (.metadata.vulnerabilities.low // 0)
+                  + (.metadata.vulnerabilities.moderate // 0)
+                  + (.metadata.vulnerabilities.high // 0)
+                  + (.metadata.vulnerabilities.critical // 0) | tostring)
+              ' audit.json
+              echo ""
+              jq -r '
+                (.vulnerabilities // {}) | to_entries[] |
+                select(.value.severity | any(. == "high" or . == "critical")) |
+                "- \(.key): \(.value.severity | join("/")) via \((.value.via // []) | map(if type=="object" then .title // .name else . end) | join(", "))"
+              ' audit.json || true
+              echo '```'
+            else
+              echo "Raw audit JSON written; jq summary unavailable."
+              echo ""
+              echo '```'
+              npm audit || true
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          HIGH=$(jq -r '.metadata.vulnerabilities.high // 0' audit.json 2>/dev/null || echo 0)
+          CRITICAL=$(jq -r '.metadata.vulnerabilities.critical // 0' audit.json 2>/dev/null || echo 0)
+
+          if [[ "${AUDIT_GATE}" == "true" ]]; then
+            if [[ "${HIGH}" -gt 0 || "${CRITICAL}" -gt 0 ]]; then
+              echo "AUDIT_GATE=true and high/critical findings present (high=${HIGH} critical=${CRITICAL})"
+              exit 1
+            fi
+            if [[ "${AUDIT_EXIT}" -ne 0 ]]; then
+              # Fail closed when audit itself failed under gate
+              echo "AUDIT_GATE=true and npm audit exited ${AUDIT_EXIT}"
+              exit 1
+            fi
+            echo "AUDIT_GATE=true: no high/critical findings"
+            exit 0
+          fi
+
+          echo "AUDIT_GATE=false: audit is non-blocking (exit was ${AUDIT_EXIT})"
+          exit 0
+
+      - name: Generate SBOM
+        run: npm run sbom
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cdx
+          path: sbom.cdx.json
+          if-no-files-found: error

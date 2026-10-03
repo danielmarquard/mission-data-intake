@@ -1,0 +1,16 @@
+node_modules/
+staging/
+*.log
+.DS_Store
+sbom.cdx.json
+dist/
+release-staging/
+mission-data-intake-*/
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tar.zst
+*.zip
+*.7z
+SHA256SUMS
+!samples/sample-package.tar.gz

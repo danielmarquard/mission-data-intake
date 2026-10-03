@@ -1,0 +1,24 @@
+{
+  "name": "mission-data-intake",
+  "version": "0.0.0",
+  "description": "UNCLASSIFIED // DEMO ONLY — Mission data package intake service for supply-chain security demos",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "sample": "node scripts/make-sample-package.js",
+    "audit": "npm audit",
+    "sbom": "npm sbom --sbom-format cyclonedx > sbom.cdx.json",
+    "smoke": "node scripts/smoke-test.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "multer": "^1.4.5-lts.2",
+    "pino": "^9.6.0",
+    "pino-http": "^10.4.0",
+    "tar": "7.5.18"
+  }
+}

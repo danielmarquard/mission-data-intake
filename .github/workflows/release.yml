@@ -1,0 +1,231 @@
+# UNCLASSIFIED // DEMO ONLY
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  AUDIT_GATE: "false"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Compute next version
+        id: version
+        run: |
+          chmod +x scripts/next-version.sh
+          VERSION="$(./scripts/next-version.sh)"
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Next version: ${VERSION} (tag ${TAG})"
+
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::Tag ${TAG} already exists. Refusing to overwrite."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate sample package
+        run: npm run sample
+
+      - name: Smoke test
+        run: npm run smoke
+
+      - name: npm audit
+        run: |
+          set +e
+          npm audit --json > audit.json
+          AUDIT_EXIT=$?
+          set -e
+
+          {
+            echo "## npm audit summary"
+            echo ""
+            echo "AUDIT_GATE=${AUDIT_GATE}"
+            echo ""
+            if command -v jq >/dev/null 2>&1 && [[ -s audit.json ]]; then
+              echo '```'
+              jq -r '
+                "vulnerabilities: " + (.metadata.vulnerabilities | to_entries | map("\(.key)=\(.value)") | join(", "))
+              ' audit.json
+              echo '```'
+            else
+              echo '```'
+              npm audit || true
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          HIGH=$(jq -r '.metadata.vulnerabilities.high // 0' audit.json 2>/dev/null || echo 0)
+          CRITICAL=$(jq -r '.metadata.vulnerabilities.critical // 0' audit.json 2>/dev/null || echo 0)
+
+          if [[ "${AUDIT_GATE}" == "true" ]]; then
+            if [[ "${HIGH}" -gt 0 || "${CRITICAL}" -gt 0 || "${AUDIT_EXIT}" -ne 0 ]]; then
+              echo "AUDIT_GATE=true: failing on audit findings/exit"
+              exit 1
+            fi
+          fi
+          echo "Audit step complete (non-blocking unless AUDIT_GATE=true)"
+          exit 0
+
+      - name: Generate SBOM
+        run: npm run sbom
+
+      - name: Stamp version into package.json (runner only)
+        run: npm version "${{ steps.version.outputs.version }}" --no-git-tag-version
+
+      - name: Install production dependencies
+        run: |
+          rm -rf node_modules
+          npm ci --omit=dev
+
+      - name: Install archive tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd p7zip-full
+
+      - name: Stage release payload and build archives
+        id: archives
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          NAME="mission-data-intake-${VERSION}"
+          STAGE="${RUNNER_TEMP}/release-stage"
+          OUT="${RUNNER_TEMP}/release-out"
+          PAYLOAD="${STAGE}/${NAME}"
+
+          rm -rf "${STAGE}" "${OUT}"
+          mkdir -p "${PAYLOAD}" "${OUT}"
+
+          cp -a src "${PAYLOAD}/src"
+          cp package.json package-lock.json Dockerfile README.md "${PAYLOAD}/"
+          cp -a samples "${PAYLOAD}/samples"
+          cp -a node_modules "${PAYLOAD}/node_modules"
+          cp sbom.cdx.json "${PAYLOAD}/sbom.cdx.json"
+
+          # Build archives from the staged directory's parent so the top-level dir is included
+          (
+            cd "${STAGE}"
+            tar -czf "${OUT}/${NAME}.tar.gz" "${NAME}"
+            tar -cjf "${OUT}/${NAME}.tar.bz2" "${NAME}"
+            tar -cJf "${OUT}/${NAME}.tar.xz" "${NAME}"
+            tar -I zstd -cf "${OUT}/${NAME}.tar.zst" "${NAME}"
+            zip -qr "${OUT}/${NAME}.zip" "${NAME}"
+            7z a -bd "${OUT}/${NAME}.7z" "${NAME}" >/dev/null
+          )
+
+          cp sbom.cdx.json "${OUT}/sbom.cdx.json"
+
+          (
+            cd "${OUT}"
+            sha256sum \
+              "${NAME}.tar.gz" \
+              "${NAME}.tar.bz2" \
+              "${NAME}.tar.xz" \
+              "${NAME}.tar.zst" \
+              "${NAME}.zip" \
+              "${NAME}.7z" \
+              > SHA256SUMS
+          )
+
+          for f in \
+            "${OUT}/${NAME}.tar.gz" \
+            "${OUT}/${NAME}.tar.bz2" \
+            "${OUT}/${NAME}.tar.xz" \
+            "${OUT}/${NAME}.tar.zst" \
+            "${OUT}/${NAME}.zip" \
+            "${OUT}/${NAME}.7z" \
+            "${OUT}/sbom.cdx.json" \
+            "${OUT}/SHA256SUMS"
+          do
+            if [[ ! -s "${f}" ]]; then
+              echo "::error::Missing or empty release asset: ${f}"
+              exit 1
+            fi
+            ls -la "${f}"
+          done
+
+          echo "out=${OUT}" >> "$GITHUB_OUTPUT"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          OUT: ${{ steps.archives.outputs.out }}
+          NAME: ${{ steps.archives.outputs.name }}
+        run: |
+          set -euo pipefail
+
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::Tag ${TAG} already exists. Refusing to overwrite."
+            exit 1
+          fi
+
+          # Also fail clearly if the remote already has the tag
+          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q .; then
+            echo "::error::Tag ${TAG} already exists on origin. Refusing to overwrite."
+            exit 1
+          fi
+
+          gh release create "${TAG}" \
+            --target "${GITHUB_SHA}" \
+            --title "${TAG}" \
+            --generate-notes \
+            "${OUT}/${NAME}.tar.gz" \
+            "${OUT}/${NAME}.tar.bz2" \
+            "${OUT}/${NAME}.tar.xz" \
+            "${OUT}/${NAME}.tar.zst" \
+            "${OUT}/${NAME}.zip" \
+            "${OUT}/${NAME}.7z" \
+            "${OUT}/sbom.cdx.json" \
+            "${OUT}/SHA256SUMS"
+
+          {
+            echo "## Release ${TAG}"
+            echo ""
+            echo "- Version: \`${VERSION}\`"
+            echo "- Tag: \`${TAG}\`"
+            echo "- Target commit: \`${GITHUB_SHA}\`"
+            echo ""
+            echo "### Assets"
+            echo ""
+            for f in \
+              "${NAME}.tar.gz" \
+              "${NAME}.tar.bz2" \
+              "${NAME}.tar.xz" \
+              "${NAME}.tar.zst" \
+              "${NAME}.zip" \
+              "${NAME}.7z" \
+              "sbom.cdx.json" \
+              "SHA256SUMS"
+            do
+              size=$(stat -c%s "${OUT}/${f}")
+              echo "- \`${f}\` (${size} bytes)"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
